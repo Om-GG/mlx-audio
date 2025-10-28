@@ -209,6 +209,58 @@ with open('./8bit/config.json', 'w') as f:
 mx.save_safetensors("./8bit/kokoro-v1_0.safetensors", weights, metadata={"format": "mlx"})
 ```
 
+## Speech-to-Text with Voxtral 24B
+
+The Voxtral 24B speech recognition model can be converted to the MLX format and quantized for fast inference on Apple Silicon using the speech-to-text (STT) utilities bundled with this repository.
+
+### 1. Download the Voxtral checkpoint
+
+1. Accept the license for the Voxtral 24B repository on Hugging Face (for example [`mlx-community/voxtral-24b-instruct`](https://huggingface.co/mlx-community/voxtral-24b-instruct)).
+2. Pull the model locally with the Hugging Face CLI:
+
+   ```bash
+   huggingface-cli download mlx-community/voxtral-24b-instruct --local-dir voxtral-24b-hf
+   ```
+
+### 2. Convert and quantize with `mlx_audio.stt.convert`
+
+Use the new conversion entry point to produce an MLX-ready checkpoint. The command below performs 4-bit group-wise quantization (group size 128) and saves the result into `voxtral-24b-mlx`.
+
+```bash
+python -m mlx_audio.stt.convert \
+  --hf-path voxtral-24b-hf \
+  --mlx-path voxtral-24b-mlx \
+  --quantize \
+  --q-group-size 128 \
+  --q-bits 4
+```
+
+> **Tip:** pass `--quant-predicate mixed_3_4` (or any of the `mixed_*` recipes) to enable mixed-bit quantization. The generated `config.json` includes a `quantization` block so that `Model.from_pretrained` re-applies the same predicate when loading.
+
+### 3. Run inference with `mlx_audio.stt.generate`
+
+Once the MLX weights are available, you can transcribe audio from the command line:
+
+```bash
+python -m mlx_audio.stt.generate \
+  --model voxtral-24b-mlx \
+  --audio path/to/audio.wav \
+  --output transcripts/output \
+  --max_tokens 256
+```
+
+The command writes the transcription to `transcripts/output.txt` (or `.srt`, `.vtt`, `.json` when `--format` is provided). For programmatic use you can load the converted model directly:
+
+```python
+from mlx_audio.stt.utils import load_model
+
+model = load_model("voxtral-24b-mlx")
+result = model.generate([mx.array(audio_waveform, dtype=mx.float16)])
+print(result.text)
+```
+
+The Python API returns an `STTOutput` object that includes the transcript and, when requested, segment metadata.
+
 ## Requirements
 
 - MLX
