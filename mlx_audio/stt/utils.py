@@ -192,7 +192,7 @@ def load_model(model_path: str, lazy: bool = False, strict: bool = True, **kwarg
     model_class, model_type = get_model_and_args(
         model_type=model_type, model_name=model_name
     )
-    model = model_class.Model.from_pretrained(model_path)
+    model = model_class.Model.from_pretrained(model_path, **kwargs)
 
     if not lazy:
         model.eval()
