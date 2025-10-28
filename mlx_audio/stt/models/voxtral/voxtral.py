@@ -214,6 +214,20 @@ class Model(nn.Module):
         self.audio_tower = Encoder(config.audio_config)
         self.multi_modal_projector = MultiModalProjector(config)
 
+    def model_quant_predicate(
+        self, path: str, module: nn.Module, config: Optional[ModelConfig] = None
+    ) -> bool:
+        """Return ``True`` only for language model modules."""
+
+        if not path:
+            return False
+
+        if path.startswith("language_model"):
+            return True
+
+        head = path.split(".", 1)[0]
+        return head in {"language_model", "model", "lm_head"}
+
     def get_audio_embeds(self, x: mx.array) -> mx.array:
         audio_embeds = self.audio_tower(x).reshape(
             -1, self.config.audio_config.intermediate_size
@@ -276,11 +290,13 @@ class Model(nn.Module):
     def sanitize(self, weights):
         sanitized_weights = {}
         for k, v in weights.items():
-            if "conv" in k and "weight" in k:
-                if v.shape[-1] < v.shape[-2]:
-                    sanitized_weights[k] = v.transpose(0, 2, 1)
-                else:
-                    sanitized_weights[k] = v
+            if (
+                "conv" in k
+                and "weight" in k
+                and hasattr(v, "shape")
+                and v.shape[-1] < v.shape[-2]
+            ):
+                sanitized_weights[k] = v.transpose(0, 2, 1)
             else:
                 sanitized_weights[k] = v
         return sanitized_weights
@@ -294,7 +310,7 @@ class Model(nn.Module):
     ):
         from transformers import AutoProcessor
 
-        processor = AutoProcessor.from_pretrained(model_path)
+        processor = AutoProcessor.from_pretrained(model_path, **kwargs)
         model_repo = model_path
         revision = kwargs.get("revision", None)
         force_download = kwargs.get("force_download", False)
@@ -302,12 +318,20 @@ class Model(nn.Module):
             model_path, revision=revision, force_download=force_download
         )
 
+        config_dict = None
+        quantization_config = None
         if config is None:
             import json
 
             with open(f"{model_path}/config.json", "r") as f:
                 config_dict = json.load(f)
+            quantization_config = config_dict.get("quantization")
             config = ModelConfig.from_dict(config_dict)
+        elif isinstance(config, ModelConfig):
+            quantization_config = getattr(config, "quantization", None)
+        elif isinstance(config, dict):
+            quantization_config = config.get("quantization")
+            config = ModelConfig.from_dict(config)
 
         model = cls(config)
         model._processor = processor
@@ -316,6 +340,27 @@ class Model(nn.Module):
         )
         model.config.model_repo = model_repo
 
+        if quantization_config:
+            group_size = quantization_config.get("group_size")
+            bits = quantization_config.get("bits")
+
+            if group_size is None or bits is None:
+                raise ValueError(
+                    "Quantization config requires both 'group_size' and 'bits'."
+                )
+
+            def class_predicate(path, module):
+                return model.model_quant_predicate(
+                    f"language_model.{path}" if path else "language_model", module, config
+                )
+
+            nn.quantize(
+                model.language_model,
+                group_size=group_size,
+                bits=bits,
+                class_predicate=class_predicate,
+            )
+
         weights = {}
         weight_files = glob.glob(str(model_path / "model-*.safetensors"))
         for file in weight_files:
@@ -323,7 +368,7 @@ class Model(nn.Module):
 
         weights = model.sanitize(weights)
 
-        model.load_weights(list(weights.items()))
+        model.load_weights(list(weights.items()), strict=True)
 
         return model
 
