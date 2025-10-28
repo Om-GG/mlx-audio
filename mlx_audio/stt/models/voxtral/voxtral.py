@@ -214,6 +214,24 @@ class Model(nn.Module):
         self.audio_tower = Encoder(config.audio_config)
         self.multi_modal_projector = MultiModalProjector(config)
 
+    def model_quant_predicate(self, path: str, module: nn.Module, config: dict) -> bool:
+        """Return whether a module should be quantized.
+
+        Voxtral only supports quantizing the underlying language model layers.
+        Delegates the decision to the wrapped language model when the module
+        belongs to that component.
+        """
+
+        if not path.startswith("language_model"):
+            return False
+
+        predicate = getattr(
+            self.language_model.model, "model_quant_predicate", lambda p, m, c: True
+        )
+        # Strip the wrapper prefix so the underlying model receives familiar paths.
+        inner_path = path.split("language_model.", 1)[-1]
+        return predicate(inner_path, module, config)
+
     def get_audio_embeds(self, x: mx.array) -> mx.array:
         audio_embeds = self.audio_tower(x).reshape(
             -1, self.config.audio_config.intermediate_size

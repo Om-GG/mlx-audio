@@ -39,7 +39,10 @@ setup(
             "tts/*.css",
             "tts/**/*.json",
             "tts/static/**/*",
+            "stt/**/*.json",
+            "stt/**/*.model",
             "stt/**/*.tiktoken",
+            "stt/**/*.txt",
         ],
     },
     classifiers=[
@@ -55,6 +58,7 @@ setup(
         "console_scripts": [
             "mlx_audio.tts.generate = mlx_audio.tts.generate:main",
             "mlx_audio.server = mlx_audio.server:main",
+            "mlx_audio.stt.convert = mlx_audio.stt.convert:main",
         ]
     },
 )

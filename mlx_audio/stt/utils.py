@@ -1,13 +1,20 @@
+import glob
 import importlib
+import json
 import logging
+import shutil
 from pathlib import Path
-from typing import List, Optional
+from textwrap import dedent
+from typing import Any, Dict, List, Optional
 
 import mlx.core as mx
 import numpy as np
 import soundfile as sf
 from huggingface_hub import snapshot_download
 from scipy import signal
+from mlx.utils import tree_flatten
+from mlx_lm.convert import mixed_quant_predicate_builder
+from mlx_lm.utils import dequantize_model, quantize_model, save_config, save_model
 
 SAMPLE_RATE = 16000
 
@@ -191,3 +198,169 @@ def load_model(model_path: str, lazy: bool = False, strict: bool = True, **kwarg
         model.eval()
 
     return model
+
+
+def upload_to_hub(path: str, upload_repo: str, hf_path: str):
+    """Upload a converted model directory to the Hugging Face Hub."""
+
+    import os
+
+    from huggingface_hub import HfApi, ModelCard, logging
+
+    from ..version import __version__
+
+    card = ModelCard.load(hf_path)
+    card.data.tags = ["mlx"] if card.data.tags is None else card.data.tags + ["mlx"]
+    card.text = dedent(
+        f"""
+        # {upload_repo}
+        This model was converted to MLX format from [`{hf_path}`](https://huggingface.co/{hf_path}) using mlx-audio version **{__version__}**.
+        Refer to the [original model card](https://huggingface.co/{hf_path}) for more details on the model.
+        ## Use with mlx
+
+        ```bash
+        pip install -U mlx-audio
+        ```
+
+        ```bash
+        python -m mlx_audio.stt.generate --model {upload_repo} --audio YOUR_AUDIO.wav --output transcript
+        ```
+        """
+    )
+    card.save(os.path.join(path, "README.md"))
+
+    logging.set_verbosity_info()
+
+    api = HfApi()
+    api.create_repo(repo_id=upload_repo, exist_ok=True)
+    api.upload_folder(
+        folder_path=path,
+        repo_id=upload_repo,
+        repo_type="model",
+    )
+    print(f"Upload successful, go to https://huggingface.co/{upload_repo} for details.")
+
+
+def _load_voxtral_weights(model_path: Path) -> Dict[str, mx.array]:
+    weight_files = sorted(model_path.glob("*.safetensors"))
+    if not weight_files:
+        raise FileNotFoundError(f"No safetensors found in {model_path}")
+
+    weights: Dict[str, mx.array] = {}
+    for file in weight_files:
+        weights.update(mx.load(file))
+
+    return weights
+
+
+def convert(
+    hf_path: str,
+    mlx_path: str = "mlx_model",
+    quantize: bool = False,
+    q_group_size: int = 64,
+    q_bits: int = 4,
+    dtype: Optional[str] = None,
+    upload_repo: Optional[str] = None,
+    revision: Optional[str] = None,
+    dequantize: bool = False,
+    quant_predicate: Optional[str] = None,
+):
+    from .models.voxtral import Model, ModelConfig
+
+    print("[INFO] Loading")
+    model_path = get_model_path(hf_path, revision=revision)
+
+    config_path = model_path / "config.json"
+    if not config_path.exists():
+        raise FileNotFoundError(f"Config not found at {config_path}")
+
+    with open(config_path, encoding="utf-8") as f:
+        config: Dict[str, Any] = json.load(f)
+
+    model_config = ModelConfig.from_dict(config)
+    model = Model(model_config)
+
+    weights = model.sanitize(_load_voxtral_weights(model_path))
+    model.load_weights(list(weights.items()))
+    weights = dict(tree_flatten(model.parameters()))
+
+    if dtype is None:
+        dtype = config.get("torch_dtype", None)
+    if dtype in MODEL_CONVERSION_DTYPES:
+        print("[INFO] Using dtype:", dtype)
+        target_dtype = getattr(mx, dtype)
+        weights = {k: v.astype(target_dtype) for k, v in weights.items()}
+        model.load_weights(list(weights.items()))
+        config["torch_dtype"] = dtype
+
+    if quantize and dequantize:
+        raise ValueError("Choose either quantize or dequantize, not both.")
+
+    predicate_from_model = getattr(
+        model, "model_quant_predicate", lambda p, m, cfg: True
+    )
+
+    recipe_predicate = None
+    if isinstance(quant_predicate, str):
+        recipe_predicate = mixed_quant_predicate_builder(
+            quant_predicate, model.language_model.model
+        )
+
+    def final_quant_predicate(path, module, cfg):
+        if not hasattr(module, "to_quantized"):
+            return False
+        if hasattr(module, "weight") and module.weight.shape[-1] % q_group_size != 0:
+            return False
+        if not predicate_from_model(path, module, cfg):
+            return False
+        if recipe_predicate is None:
+            return True
+        inner_path = path.split("language_model.", 1)[-1]
+        return recipe_predicate(inner_path, module, cfg)
+
+    if quantize:
+        print("[INFO] Quantizing")
+        weights, config = quantize_model(
+            model,
+            config,
+            q_group_size,
+            q_bits,
+            quant_predicate=final_quant_predicate,
+        )
+
+    if dequantize:
+        print("[INFO] Dequantizing")
+        model = dequantize_model(model)
+        weights = dict(tree_flatten(model.parameters()))
+        config.pop("quantization", None)
+
+    if isinstance(mlx_path, str):
+        mlx_path = Path(mlx_path)
+
+    mlx_path.mkdir(parents=True, exist_ok=True)
+
+    copy_patterns = [
+        "*.py",
+        "*.json",
+        "*.model",
+        "*.tiktoken",
+        "*.txt",
+        "*.yaml",
+        "*.safetensors",
+    ]
+
+    for pattern in copy_patterns:
+        for file in glob.glob(str(model_path / pattern)):
+            shutil.copy(file, mlx_path)
+
+        for file in glob.glob(str(model_path / "**" / pattern), recursive=True):
+            rel_path = Path(file).relative_to(model_path)
+            dest_dir = mlx_path / rel_path.parent
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            shutil.copy(file, dest_dir)
+
+    save_model(mlx_path, model, donate_model=True)
+    save_config(config, config_path=mlx_path / "config.json")
+
+    if upload_repo is not None:
+        upload_to_hub(str(mlx_path), upload_repo, hf_path)
