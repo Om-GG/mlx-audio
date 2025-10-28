@@ -1,3 +1,7 @@
 include ./requirements.txt
 recursive-include mlx_audio/ *.py
-recursive-include mlx_audio/tts *.html 
+recursive-include mlx_audio/tts *.html
+recursive-include mlx_audio/stt *.json
+recursive-include mlx_audio/stt *.model
+recursive-include mlx_audio/stt *.tiktoken
+recursive-include mlx_audio/stt *.txt
